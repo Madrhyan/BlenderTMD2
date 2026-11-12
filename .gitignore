@@ -1,5 +1,4 @@
 __pycache__/
 *.py[cod]
 dist/
-release/*.zip
 .venv/
