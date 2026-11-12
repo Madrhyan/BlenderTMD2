@@ -1,0 +1,32 @@
+schema_version = "1.0.0"
+
+# Blender extension manifest for ChatGPT TMD2.
+# The extension id deliberately differs from "BlenderTMD2" so both extensions
+# can be installed and enabled at the same time.
+id = "chatgpt_tmd2"
+version = "1.0.0"
+name = "ChatGPT TMD2"
+tagline = "Faithful material import/export for Captain Tsubasa: Rise of New Champions TMD2 models"
+maintainer = "ChatGPT TMD2"
+type = "add-on"
+
+website = "https://github.com/Madrhyan/BlenderTMD2"
+
+tags = ["Import-Export", "Material"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Read TMD2/LDS files from disk and write exported models and textures"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+  "/tests/",
+]
