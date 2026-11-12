@@ -68,6 +68,15 @@ def _params(shader):
     elif shader in ("BHA1", "BHG1"):
         params[9:12] = [0.99, 0.76, 0.33]
         params[12:15] = [0.88, 0.58, 0.22]
+    elif shader in ("BEH0", "BES0"):
+        # unlit effects carry their tint as a float4 block after a scalar
+        params[0] = 0.75
+        params[3:6] = [1.0, 0.72, 0.05]
+    elif shader == "ZZZZ":
+        # trailing padding is 1.0 -> the block before it must stay at index 3
+        params[0] = 0.0
+        params[3:6] = [0.8, 0.1, 0.1]
+        params[6] = 1.0
     return params
 
 
@@ -373,6 +382,92 @@ def test_negative():
     check(abs(linear_to_srgb(srgb_to_linear(0.5)) - 0.5) < 1e-4, "colour conversion roundtrip")
 
 
+def test_missing_textures(tmpdir):
+    """Regression: a model without its .lds used to render pitch black.
+
+    A Blender image node without an image outputs black, and a Vertex Color node
+    pointing at a non existent layer does the same.  Both are now disconnected so
+    the material falls back to the neutral library constants.
+    """
+    print("[5] missing textures / black model regression")
+    from chatgpt_tmd2.core.textures import placeholder_image
+
+    grey = placeholder_image("CTMD2_selftest_placeholder", 8, 8)
+    check(tuple(grey.pixels[:3]) != (0.0, 0.0, 0.0), "placeholder image is black")
+    check(max(grey.pixels[:3]) > 0.5, f"placeholder image too dark: {grey.pixels[:3]}")
+
+    # a file without a matching .lds
+    lonely_dir = os.path.join(tmpdir, "lonely")
+    os.makedirs(lonely_dir, exist_ok=True)
+    lonely = os.path.join(lonely_dir, "lonely_bss1.tmd2")
+    make_sample(lonely, "BSS1", with_lds=False)
+    if os.path.exists(os.path.join(lonely_dir, "lonely_bss1.lds")):
+        os.remove(os.path.join(lonely_dir, "lonely_bss1.lds"))
+
+    result = bpy.ops.ctmd2.import_tmd2(
+        filepath=lonely, directory=lonely_dir,
+        files=[{"name": os.path.basename(lonely)}])
+    check(result == {'FINISHED'}, "import without .lds failed")
+
+    materials = [m for m in bpy.data.materials
+                 if getattr(m, "ctmd2_material", None)
+                 and m.ctmd2_material.shader_id == "BSS1"
+                 and m.name.startswith("lonely_bss1")]
+    if not check(bool(materials), "material without textures missing"):
+        return
+    material = materials[0]
+
+    # every image node must either hold a real image or be disconnected
+    for node in material.node_tree.nodes:
+        if node.type != 'TEX_IMAGE':
+            continue
+        if node.image is None:
+            check(all(not socket.links for socket in node.outputs),
+                  f"{node.name} has no image but is still linked (feeds black)")
+            check("MISSING" in node.label, f"{node.name} not flagged as missing")
+
+    # no vertex colour node may point at a layer the mesh does not have
+    for node in material.node_tree.nodes:
+        if node.type != 'VERTEX_COLOR':
+            continue
+        layers = []
+        for obj in bpy.data.objects:
+            if obj.type == 'MESH' and any(slot.material == material for slot in obj.material_slots):
+                layers += [attribute.name for attribute in obj.data.color_attributes]
+        check(node.layer_name in layers or node.mute,
+              f"vertex colour node points at a missing layer: {node.layer_name}")
+
+    check(material.diffuse_color[0] > 0.5 and material.diffuse_color[1] > 0.5,
+          f"viewport colour is too dark: {material.diffuse_color[:]}")
+    check("missing textures" in material.ctmd2_material.notes,
+          f"missing textures not reported: {material.ctmd2_material.notes!r}")
+
+
+def test_effect_colour(tmpdir):
+    """Regression: unlit/effect shaders must keep their parameter tint."""
+    print("[6] effect (unlit) shader tint")
+    path = os.path.join(tmpdir, "selftest_effect.tmd2")
+    make_sample(path, "BEH0")
+    result = bpy.ops.ctmd2.import_tmd2(
+        filepath=path, directory=tmpdir,
+        files=[{"name": os.path.basename(path)}])
+    check(result == {'FINISHED'}, "effect shader import failed")
+    materials = [m for m in bpy.data.materials
+                 if getattr(m, "ctmd2_material", None)
+                 and m.ctmd2_material.shader_id == "BEH0"]
+    if not check(bool(materials), "effect material missing"):
+        return
+    props = materials[0].ctmd2_material
+    check(props.emission_strength > 0.0, "effect shader does not glow")
+    check(props.emission_color[0] > 0.5 and props.emission_color[2] < 0.5,
+          f"effect tint not taken from shaderParams: {props.emission_color[:]}")
+    emission = [n for n in materials[0].node_tree.nodes if n.type == 'EMISSION']
+    check(bool(emission), "effect material has no emission node")
+    if emission:
+        strength = emission[0].inputs['Strength'].default_value
+        check(strength >= 1.0, f"emission strength too weak to be visible: {strength}")
+
+
 def _fake_layout(log):
     class Fake:
         def __init__(self):
@@ -516,6 +611,18 @@ def main():
     except Exception:
         traceback.print_exc()
         FAILURES.append("material rebuild raised")
+
+    try:
+        test_missing_textures(tmpdir)
+    except Exception:
+        traceback.print_exc()
+        FAILURES.append("missing texture handling raised")
+
+    try:
+        test_effect_colour(tmpdir)
+    except Exception:
+        traceback.print_exc()
+        FAILURES.append("effect shader colour raised")
 
     try:
         test_ui(collection)

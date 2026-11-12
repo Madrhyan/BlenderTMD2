@@ -202,11 +202,25 @@ def non_color_copy(image):
     return copy
 
 
-def placeholder_image(name, width=64, height=64):
+#: Colour of the image used for a texture that could not be loaded.  A
+#: generated image is BLACK by default, which is exactly why imported models
+#: used to render pitch black whenever the .lds was missing.  A light grey
+#: stand-in keeps the model readable and makes the missing texture obvious.
+PLACEHOLDER_COLOR = (0.8, 0.8, 0.8, 1.0)
+
+
+def placeholder_image(name, width=64, height=64, missing=True):
     image = bpy.data.images.get(name)
     if image:
         return image
-    image = bpy.data.images.new(name, width=max(1, width), height=max(1, height))
+    image = bpy.data.images.new(name, width=max(1, width), height=max(1, height),
+                                alpha=True)
+    image.generated_color = PLACEHOLDER_COLOR
+    if missing:
+        try:
+            image["ctmd2_missing"] = True
+        except Exception:
+            pass
     image.use_fake_user = True
     return image
 

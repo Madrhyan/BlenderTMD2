@@ -274,6 +274,7 @@ class Interpretation:
         self.scalars = []         # [(name, value)]
         self.notes = []
         self.unmapped_colors = []
+        self.base_image = None
 
 
 def _param(tm_material, index, default=0.0):
@@ -384,16 +385,31 @@ def analyse(tm_material, images=None, settings=None):
         # Effect shaders whose textures are grayscale need their parameter
         # colour to reproduce the in-game tint (golden tiger aura, red spirit...).
         if desc.family in ("effect", "unlit"):
+            tint = None
+            tint_source = None
             for name, values in interp.colors:
                 if not is_black(values):
-                    interp.base_color = to_linear_rgba(values, 1.0)
-                    interp.emission_color = to_linear_rgba(values, 1.0)
-                    interp.emission_strength = 1.0
-                    interp.notes.append(f"{desc.family} tint from {name}")
+                    tint, tint_source = values, name
                     break
+            if tint is None:
+                # The library has no dedicated colour slot for these shaders, so
+                # the tint has to come from the parameter block.  ``best_color``
+                # only reports float4 aligned, saturated blocks - nothing is
+                # invented, an all-zero parameter block simply yields no tint.
+                best = shader_db.best_color(params)
+                if best is not None:
+                    start, values = best
+                    tint = values
+                    tint_source = f"param[{start}..{start + 2}]"
+                    interp.colors.append((tint_source, values))
+            if tint is not None:
+                rgba = to_linear_rgba(tint, 1.0)
+                interp.base_color = rgba
+                interp.emission_color = rgba
+                interp.notes.append(f"{desc.family} tint from {tint_source}")
             if interp.emission_strength <= 0.0:
-                # Unlit shaders always glow slightly, that is what makes the
-                # golden / spirit style effects look right in EEVEE.
+                # Unlit shaders always glow: that is what makes the golden /
+                # spirit style effects look right in EEVEE and Cycles.
                 interp.emission_color = interp.base_color
                 interp.emission_strength = 1.0
                 interp.notes.append(f"{desc.family} shader emits its base colour")
@@ -440,10 +456,12 @@ def analyse(tm_material, images=None, settings=None):
     # Vertex colours are only meaningful for shaders that read them.  Multiplying
     # a coloured base texture with the (often dark) vertex colours would destroy
     # the in-game look, which is a common complaint about naive importers.
+    # remember the base texture: unlit shaders re-use it for their emission
+    if textures and textures[0]["image"] is not None:
+        interp.base_image = textures[0]["image"]
+
     if interp.known and desc is not None and desc.family == "body":
-        base_image = None
-        if textures and textures[0]["image"] is not None:
-            base_image = textures[0]["image"]
+        base_image = interp.base_image
         if base_image is not None and not _image_is_grayscale(base_image):
             interp.uses_vertex_color = False
             interp.notes.append("vertex colour skipped: base texture is coloured")
@@ -469,21 +487,70 @@ def analyse(tm_material, images=None, settings=None):
 # ---------------------------------------------------------------------------
 # Texture assignment
 # ---------------------------------------------------------------------------
+def _set_viewport_color(material, interp):
+    """Colour used by the solid view and the material preview thumbnail.
+
+    The real colour lives inside the shader node group, but the solid view only
+    reads ``Material.diffuse_color``.  White is used for known shaders driven by
+    a texture so the model never shows up as a black blob in the viewport.
+    """
+    colour = tuple(interp.base_color)
+    if interp.known and not interp.colors:
+        colour = (1.0, 1.0, 1.0, 1.0)
+    try:
+        material.diffuse_color = colour
+    except Exception:
+        pass
+    try:
+        material.metallic = 0.0
+        material.roughness = 0.6
+    except Exception:
+        pass
+
+
+def _disconnect_node(material, node):
+    """Remove every link of an image node so its default colour is used."""
+    nt = _nodes(material)
+    if nt is None:
+        return
+    for socket in list(node.outputs):
+        for link in list(socket.links):
+            nt.links.remove(link)
+
+
+def _placeholder_image(name="CTMD2_missing_texture"):
+    """Light grey stand-in for a texture that was never loaded."""
+    from .textures import placeholder_image
+    return placeholder_image(name)
+
+
 def _assign_library_textures(material, desc, tm_material, images, notes):
-    """Assign the images to the image nodes of the game shader graph."""
+    """Assign the images to the image nodes of the game shader graph.
+
+    Textures that cannot be resolved are *wired to nothing*: a Blender image node
+    without an image outputs black, which made every model whose ``.lds`` was
+    missing render as a silhouette.  Unconnected group inputs keep the neutral
+    values of the material library instead (and the user is told about it).
+    """
     nt = _nodes(material)
     if nt is None:
         return
     textures = _texture_images(tm_material, images)
+    missing = []
     for slot in desc.textures:
-        if slot.tex_index >= len(textures):
-            continue
-        image = textures[slot.tex_index]["image"]
         node = nt.nodes.get(slot.node)
         if node is None or node.type != 'TEX_IMAGE':
             continue
+        image = None
+        if slot.tex_index < len(textures):
+            image = textures[slot.tex_index]["image"]
         if image is None:
-            notes.append(f"missing image for {slot.name}")
+            _disconnect_node(material, node)
+            if slot.role:
+                node.label = f"{slot.name}: MISSING ({slot.role})"
+            else:
+                node.label = f"{slot.name}: MISSING"
+            missing.append(slot.name)
             continue
         node.image = image
         try:
@@ -493,6 +560,8 @@ def _assign_library_textures(material, desc, tm_material, images, notes):
         node.label = f"{slot.name}: {slot.role}" if slot.role else slot.name
         if slot.uv:
             _ensure_uv_node(nt, slot.uv, node)
+    if missing:
+        notes.append("missing textures: " + ", ".join(missing))
 
 
 def _apply_library_params(material, desc, tm_material, interp):
@@ -568,34 +637,73 @@ def _iter_all_nodes(nt, _seen=None):
                 yield child
 
 
+def _bypass_node(nt, node):
+    """Rewire ``node``'s consumers to a neutral value and drop its links.
+
+    A ``Vertex Color`` node that points at a layer the mesh does not have
+    evaluates to *black*, and because the game shaders multiply their base
+    texture with it the whole model turns black.  When there is no usable colour
+    attribute the node is unlinked instead, so the group falls back to its
+    neutral constants.
+    """
+    for output in list(node.outputs):
+        for link in list(output.links):
+            target = link.to_socket
+            nt.links.remove(link)
+            if target.type == 'RGBA':
+                target.default_value = (1.0, 1.0, 1.0, 1.0)
+            elif target.type == 'VALUE':
+                target.default_value = 1.0
+    node.label = "Vertex Color: MISSING (set to white)"
+    node.mute = True
+
+
 def _apply_vertex_color_nodes(material, color_layer_names, interp):
     """Point every Vertex Color node at a colour layer that actually exists."""
     nt = _nodes(material)
-    if nt is None or not color_layer_names:
+    if nt is None:
         return
-    first = color_layer_names[0]
+    names = [name for name in (color_layer_names or []) if name]
+    first = names[0] if names else None
     found = 0
-    for node in _iter_all_nodes(nt):
+    for node in list(_iter_all_nodes(nt)):
         if node.type != 'VERTEX_COLOR':
             continue
         found += 1
         current = node.layer_name
-        if current in color_layer_names:
+        if current in names:
             continue
         # "Color2" nodes should stay on the second layer when there is one,
         # otherwise they are left untouched instead of silently reading the
         # first layer twice.
         if current and current.lower().endswith("2"):
-            if len(color_layer_names) > 1:
-                node.layer_name = color_layer_names[1]
-        elif current in ("", "Color", "Col"):
-            node.layer_name = first
-    if found:
+            if len(names) > 1:
+                node.layer_name = names[1]
+            elif first:
+                node.layer_name = first
+            else:
+                _bypass_node(nt, node)
+        elif current in ("", "Color", "Col") or current not in names:
+            if first:
+                node.layer_name = first
+            else:
+                _bypass_node(nt, node)
+    if found and first:
         interp.uses_vertex_color = True
 
 
-def _add_emission_overlay(material, interp):
-    """Mix an emission shader into the material output (additive glow)."""
+def _add_emission_overlay(material, interp, base_color_linked=False):
+    """Add the emission term that the game shader would add.
+
+    Two different situations have to be covered:
+
+    * the shader already contributes its own colour through the group result
+      (``BSS1`` and friends) - the glow is simply *added* on top;
+    * the shader is unlit (``BES0``, ``BEH0``) - its colour comes from the
+      parameter block, so the emission source is that colour, optionally
+      modulated by the base texture.  Without this the unlit materials render as
+      flat grey, which is the opposite of the golden / red effect look.
+    """
     nt = _nodes(material)
     if nt is None:
         return
@@ -612,8 +720,37 @@ def _add_emission_overlay(material, interp):
     emission.name = "CTMD2 Emission"
     emission.label = "CTMD2 Emission"
     emission.inputs['Color'].default_value = interp.emission_color
-    emission.inputs['Strength'].default_value = max(interp.emission_strength, 0.0)
+    # Emission strength is what turns a dark model into the glowing game look,
+    # a value of exactly 1.0 adds almost nothing on its own.
+    emission.inputs['Strength'].default_value = max(interp.emission_strength, 1.0)
     emission.location = (output.location.x - 200, output.location.y - 300)
+
+    color_source = None
+    if not base_color_linked:
+        base_image = getattr(interp, "base_image", None)
+        if base_image is not None:
+            tex = nt.nodes.new('ShaderNodeTexImage')
+            tex.name = "CTMD2 Emission Texture"
+            tex.label = "CTMD2 Emission (base texture)"
+            tex.image = base_image
+            tex.location = (output.location.x - 500, output.location.y - 300)
+            try:
+                tex.image.colorspace_settings.name = 'sRGB'
+            except Exception:
+                pass
+            color_source = tex.outputs['Color']
+        if color_source is not None:
+            # tint the texture with the colour taken from the parameter block
+            mix = nt.nodes.new('ShaderNodeMix')
+            mix.data_type = 'RGBA'
+            mix.blend_type = 'MULTIPLY'
+            mix.inputs['Factor'].default_value = 1.0
+            mix.location = (output.location.x - 350, output.location.y - 300)
+            nt.links.new(color_source, mix.inputs[6])
+            mix.inputs[7].default_value = interp.emission_color
+            color_source = mix.outputs[2]
+        else:
+            color_source = None
 
     add = nt.nodes.new('ShaderNodeAddShader')
     add.name = "CTMD2 Emission Add"
@@ -833,13 +970,12 @@ def build_material(name, tm_material, images, settings=None, color_layers=None,
             except Exception:
                 pass
         else:
-            _add_emission_overlay(material, interp)
+            # unlit / effect shaders have no colour of their own in the graph
+            unlit = bool(desc is not None and desc.family in ("unlit", "effect"))
+            _add_emission_overlay(material, interp, base_color_linked=not unlit)
 
     _set_blend(material, force_blend or interp.blend)
-    try:
-        material.diffuse_color = interp.base_color
-    except Exception:
-        pass
+    _set_viewport_color(material, interp)
 
     store_interpretation(material, tm_material, interp, images)
     return material
@@ -916,6 +1052,7 @@ def rebuild_material_from_props(material, settings=None):
         if interp.emission_strength > 0.0:
             _add_emission_overlay(new_mat, interp)
         _set_blend(new_mat, interp.blend)
+        _set_viewport_color(new_mat, interp)
         _swap_node_tree(material, new_mat)
         store_interpretation(material, shim, interp, images)
         bpy.data.materials.remove(new_mat)

@@ -70,6 +70,37 @@ files can be selected in the import dialog.
 | Import Vertex Colors | Create `Color`/`Color2` attributes on the mesh |
 | Import Custom Normals | Use the normals stored in the TMD2 vertices |
 
+## The model is black / grey - checklist
+
+A TMD2 model has **no colours of its own**: every pixel comes from the textures
+stored in the sibling `.lds` file.  If the model is a silhouette, work through
+this list in order.
+
+1. **Is the ChatGPT TMD2 material actually on the mesh?**
+   The original add-on and this one create different objects and materials
+   (`#TMD PROPERTIES` vs `#CTMD2 PROPERTIES`).  If the outliner shows
+   `#TMD PROPERTIES`, the file was imported by the *original* add-on - use
+   `File > Import > Tamsoft TMD2 (ChatGPT TMD2)` instead.  In
+   `Properties > Material` the panel must say **ChatGPT TMD2 Material**.
+2. **Was the `.lds` found?**
+   The importer looks for `<model>.lds` next to the `.tmd2` (same name).  If it
+   is missing, the material panel reports `missing textures: ...` and every
+   affected image node is labelled `MISSING`.  Missing textures are left
+   unconnected now, so the model stays neutral grey instead of turning black -
+   but there is no colour to show until the `.lds` (or loose `.dds` files) are
+   provided.  You can add them at any time and press **Rebuild** in the material
+   panel.
+3. **Are the textures really decoded?**  In `Properties > Material` press
+   **Report**; the console lists every slot with its image and size.  A `0x0`
+   image means the DDS variant could not be decoded by Blender and is reported as
+   a missing texture instead of silently becoming black.
+4. **Is the render engine EEVEE?**  The shipped game shaders use *Shader to RGB*,
+   which only exists in EEVEE Next (Blender 4.2+).  In Cycles those shaders
+   render flat and dark - that is a limitation of the node group, not of the
+   import.  `Shader to RGB` is the reason the toon shadow ramp works at all.
+5. **Is the model inside a subdivision surface / has no UVs?**  Both are fine,
+   but a mesh without a `UVMap` layer cannot sample any texture.
+
 ## Testing status
 
 The add-on was developed and validated head-lessly with the `bpy` 4.2 Python
@@ -78,12 +109,12 @@ valid header, material block, vertex/index buffers and DXT1 textures).  The
 repository contains no real *Captain Tsubasa* asset, so the following could not
 be verified here:
 
-* rendering the imported materials in EEVEE/Cycles (no GPU or GL context in the
-  test environment)
+* rendering the imported materials in EEVEE (no GPU or GL context in the test
+  environment); Cycles renders were used for the automated brightness checks
 * the visual result on real game models and real shader parameter values
 * exporting a real game file back into the game
 
-What *was* verified automatically (`tests/selftest.py`, 132 checks): registration
+What *was* verified automatically (`tests/selftest.py`, 149 checks): registration
 and identifier isolation from the original add-on, registration/unregistration
 symmetry, import of a synthetic file (meshes, UV sets, vertex colours, textures,
 material colour/alpha/emission values), material rebuild, panel drawing, and an
