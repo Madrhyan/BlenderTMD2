@@ -1,0 +1,17 @@
+schema_version = "1.0.0"
+
+id = "chatgpt_tmd2"
+version = "2.1.0"
+name = "ChatGPT TMD2"
+tagline = "Enhanced TamEngine TMD2/TMD/LDS/VFXT Importer & Shader Reconstructor (Captain Tsubasa: RONC)"
+maintainer = "ChatGPT TMD2 Contributors (derived from BlenderTMD2 by HydraBladeZ)"
+type = "add-on"
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Import and export TamEngine .tmd2, .tmd, .lds, .vfxt, .cat, and .tmo files from disk"
